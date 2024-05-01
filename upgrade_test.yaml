@@ -1,0 +1,224 @@
+---
+- name: Upgrade process automation
+  hosts: all_servers
+  become: yes
+  become_user: root
+  become_method: sudo
+  connection: ssh
+
+  vars:
+    build_number: "4.5.0-10595"
+    db_user: "posadmin"
+    build_path: "/root/builds/{{ build_number }}"
+    password_build_server: "redhat"
+    destination_dir: "/opt/ram/"
+    instance: "auto"
+    schema: "auto_test"
+    secondary_db: "secondaryDb1"
+    ansible_become_password: "@ut0mation"
+
+  tasks:
+    - name: Sync build from build server
+      block:
+        - name: syncing files from build server
+          shell: "sshpass -p '{{ password_build_server }}' rsync -vazP root@10.8.55.165:{{ build_path }} /root/builds"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+      
+
+    - name: Modify vft.sql file
+      ansible.builtin.replace:
+        path: "{{ build_path }}/WEB-INF/install/sql/vft.sql"
+        regexp: 'postgres'
+        replace: "{{ db_user }}"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+      
+    - name: Modify functions file
+      ansible.builtin.replace:
+        path: "{{ build_path }}/WEB-INF/install/bin/functions"
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+      loop:
+        - { regexp: 'PGUSER=postgres', replace:  'PGUSER={{ db_user }}'}
+        - { regexp: 'PG_VER=10', replace:  'PG_VER=12'}
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+      
+
+    - name: Check if hl7 files exist before modification
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: file_stats
+      with_items:
+        - "{{ build_path }}/WEB-INF/install/bin/hl7_db_lab_in.pl"
+        - "{{ build_path }}/WEB-INF/install/bin/hl7_db_lab_order.pl"
+        - "{{ build_path }}/WEB-INF/install/bin/hl7_istat_recv.pl"
+        - "{{ build_path }}/WEB-INF/install/bin/hl7_lab_in.pl"
+        - "{{ build_path }}/WEB-INF/install/bin/hl7_rad_in.pl"
+        - "{{ build_path }}/WEB-INF/install/bin/hl7_rad_rpt.pl"
+        - "{{ build_path }}/WEB-INF/install/bin/hl7_lab_order.pl"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+      
+
+    - name: Modify files with database user
+      ansible.builtin.replace:
+        path: "{{ item.item }}"
+        regexp: 'postgres'
+        replace: "{{ db_user }}"
+      when: item.stat.exists
+      with_items: "{{ file_stats.results }}"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+
+    - name: Ensure destination directory exists
+      ansible.builtin.file:
+        path: "{{ destination_dir }}"
+        state: directory
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+
+    - name: Take backup of important files
+      ansible.builtin.command: "cp {{ item.src }} {{ item.dest }}"
+      loop:
+        - { src: "/root/webapps/insta{{ instance }}/WEB-INF/install/schedular.cron", dest: "{{ destination_dir }}" }
+        - { src: "/root/webapps/insta{{ instance }}/WEB-INF/install/lib/SCM/DBConf.pm", dest: "{{ destination_dir }}" }
+        - { src: "/root/webapps/insta{{ instance }}/WEB-INF/classes/ehcache.xml", dest: "{{ destination_dir }}" }
+        - { src: "/usr/local/tomcat/conf/Catalina/localhost/insta{{ instance }}.xml", dest: "{{ destination_dir }}" }
+        - { src: "/etc/cron.d/{{ instance }}", dest: "{{ destination_dir }}" }
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+      
+
+    - name: Take backup of application 
+      ansible.builtin.shell: "cp -r /root/webapps/insta{{ instance }} /root/webapps/insta{{ instance }}$(date +'%y%m%d')"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+
+    - name: Stop Tomcat and Cron on node 1 server
+      ansible.builtin.command: "/etc/init.d/tomcat stop && /etc/init.d/cron stop"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+      
+    - name: Stop Tomcat on the other servers
+      ansible.builtin.command: "/etc/init.d/tomcat stop"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname in ['10.8.55.141', '10.8.55.142']
+      
+    - name: Run application upgrade script
+      ansible.builtin.command: "/root/webapps/insta{{ instance }}/WEB-INF/install/bin/upgrade {{ build_number }}"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+
+    - name: Stop TOMCAT service (again)
+      ansible.builtin.command: "/etc/init.d/tomcat stop"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+
+    - name: Restore files taken Backup
+      ansible.builtin.command: "cp {{ item.src_file }} {{ item.dest_file }}"
+      loop:
+        - { src_file: "/opt/ram/schedular.cron", dest_file: "/root/webapps/insta{{ instance }}/WEB-INF/install/schedular.cron" }
+        - { src_file: "/opt/ram/DBConf.pm", dest_file: "/root/webapps/insta{{ instance }}/WEB-INF/install/lib/SCM/DBConf.pm" }
+        - { src_file: "/opt/ram/ehcache.xml", dest_file: "/root/webapps/insta{{ instance }}/WEB-INF/classes/ehcache.xml" }
+        - { src_file: "/opt/ram/insta{{ instance }}.xml", dest_file: "/usr/local/tomcat/conf/Catalina/localhost/insta{{ instance }}.xml" }
+        - { src_file: "/opt/ram/{{ instance }}", dest_file: "/etc/cron.d/{{ instance }}" }
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+
+    - name: Edit application.properties File
+      ansible.builtin.replace:
+        path: "/root/webapps/insta{{ instance }}/WEB-INF/classes/java/resources/application.properties"
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+      loop:
+        - { regexp: '^defaultHospital=.*$', replace: 'defaultHospital={{ schema }}' }
+        - { regexp: '^hospital\.all\.secondary\.db\.names=.*$', replace: 'hospital.all.secondary.db.names={{ secondary_db }}' }
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+
+    - name: Run the permission script on the server.
+      shell: "psql -U posadmin -d auto -t -A -f /opt/permission_script.sql"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.110"
+
+    - name: Start Tomcat and Cron on node 1 server
+      ansible.builtin.command: "/etc/init.d/tomcat start && /etc/init.d/cron start"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+
+    - name: Rsync application to node 2
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+      shell: "sshpass -p {{ ansible_become_password }} rsync -vazP /root/webapps/insta{{ instance }} automation@10.8.55.141:/home/automation/"
+
+    - name: Rsync application to node 3
+      shell: "sshpass -p {{ ansible_become_password }} rsync -vazP /root/webapps/insta{{ instance }} automation@10.8.55.142:/home/automation/"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+
+    - name: Rsync application to hl7 server
+      shell: "sshpass -p {{ ansible_become_password }} rsync -vazP /root/webapps/insta{{ instance }} automation@10.8.55.23:/home/automation/"
+      become_user: root
+      remote_user: automation
+      when: inventory_hostname == "10.8.55.140"
+
+    - name: Take backup of important files on other app servers
+      become_user: root
+      remote_user: automation
+      ansible.builtin.shell: "cp {{ item.src }} {{ item.dest }}"
+      loop:
+        - { src: "/root/webapps/insta{{ instance }}/WEB-INF/install/schedular.cron", dest: "{{ destination_dir }}" }
+        - { src: "/root/webapps/insta{{ instance }}/WEB-INF/install/lib/SCM/DBConf.pm", dest: "{{ destination_dir }}" }
+        - { src: "/root/webapps/insta{{ instance }}/WEB-INF/classes/ehcache.xml", dest: "{{ destination_dir }}" }
+        - { src: "/usr/local/tomcat/conf/Catalina/localhost/insta{{ instance }}.xml", dest: "{{ destination_dir }}" }
+      when: inventory_hostname in ['10.8.55.141', '10.8.55.142']
+
+    - name: Take backup of application
+      become_user: root
+      remote_user: automation
+      ansible.builtin.shell: "cp -r /root/webapps/insta{{ instance }} /root/webapps/insta{{ instance }}$(date +'%y%m%d')"
+      when: inventory_hostname in ['10.8.55.141', '10.8.55.142']
+
+    - name: Log into other servers and sync application to /root/webapps/
+      become_user: root
+      remote_user: automation
+      ansible.builtin.shell: "rsync -vazP /home/automation/insta{{ instance }} /root/webapps/"
+      when: inventory_hostname in ['10.8.55.141', '10.8.55.142', '10.8.55.23']
+
+    - name: Restore files taken Backup on other app servers
+      become_user: root
+      remote_user: automation
+      ansible.builtin.command: "cp {{ item.src_file }} {{ item.dest_file }}"
+      loop:
+        - { src_file: "/opt/ram/schedular.cron", dest_file: "/root/webapps/insta{{ instance }}/WEB-INF/install/schedular.cron" }
+        - { src_file: "/opt/ram/DBConf.pm", dest_file: "/root/webapps/insta{{ instance }}/WEB-INF/install/lib/SCM/DBConf.pm" }
+        - { src_file: "/opt/ram/ehcache.xml", dest_file: "/root/webapps/insta{{ instance }}/WEB-INF/classes/ehcache.xml" }
+        - { src_file: "/opt/ram/insta{{ instance }}.xml", dest_file: "/usr/local/tomcat/conf/Catalina/localhost/insta{{ instance }}.xml" }
+      when: inventory_hostname in ['10.8.55.141', '10.8.55.142']
+
+    - name: Start Tomcat on the other servers
+      become_user: root
+      remote_user: automation
+      ansible.builtin.command: "/etc/init.d/tomcat start"
+      when: inventory_hostname in ['10.8.55.141', '10.8.55.142']
+      
